@@ -13,10 +13,144 @@ import csv
 import time
 import random
 import json
+from collections import defaultdict
 from datetime import datetime
 from torch.utils.data import Dataset
 from utils import int16_to_float32
+from glob import glob
+import pandas as pd
+import torchaudio
 
+from utils import read_audio, process_labels
+
+class StronglyAnnotatedSet(Dataset):
+    def __init__(self, audio_folder, tsv_entries, encoder, config, pad_to=10, resolution = 0.320, eval_mode = False):
+        self.encoder = encoder
+        self.config = config
+        self.fs = self.config.sample_rate
+        self.pad_to = pad_to * self.fs
+        self.eval_mode = eval_mode
+
+        self._init_examples(tsv_entries, audio_folder, resolution = 0.320)
+
+        if not self.eval_mode:
+            self.generate_queue()
+
+    def _init_examples(self, tsv_entries, audio_folder, resolution = 0.320):
+        tsv_entries = tsv_entries.dropna()
+        self.tsv_entries = []
+        examples = {}
+        self.class_set = []
+        self.audio_durations = {}
+        self.ground_truth = {}
+        self.idx = defaultdict(list)
+
+        for _, r in tsv_entries.iterrows():
+            if r["end_time_seconds"] - r["start_time_seconds"] < resolution:
+                continue
+
+            
+            if r["segment_id"] not in examples.keys():
+                examples[r["segment_id"]] = {"mixture": os.path.join(audio_folder, r["segment_id"]),
+                                             "events": []}
+                self.ground_truth[os.path.splitext(r["segment_id"])[0]] = []
+
+            examples[r["segment_id"]]["events"].append(
+                {"event_label": r["label"],
+                    "onset": r["start_time_seconds"],
+                    "offset": r["end_time_seconds"],}
+                )
+            self.ground_truth[os.path.splitext(r["segment_id"])[0]].append([r["start_time_seconds"], r["end_time_seconds"], r["label"]])
+            
+            class_idx = self.encoder.labels.index(r["label"])
+            self.idx[class_idx].append(r["segment_id"])
+
+            if class_idx not in self.class_set:
+                self.class_set.append(class_idx)
+
+            if os.path.splitext(r["segment_id"])[0] not in self.audio_durations.keys():
+                metadata = torchaudio.info(os.path.join(audio_folder, r["segment_id"]))
+                self.audio_durations[os.path.splitext(r["segment_id"])[0]] = metadata.num_frames / metadata.sample_rate
+
+            self.tsv_entries.append(r)
+
+        self.tsv_entries = pd.DataFrame(self.tsv_entries, columns=tsv_entries.columns)
+
+        # we construct a dictionary for each example
+        self.examples = examples
+        self.examples_list = list(examples.keys())
+
+        self.total_size = len(self.examples_list)
+        self.classes_num = len(self.class_set)
+
+    def __len__(self):
+        return self.total_size
+
+    def __getitem__(self, index):
+        if not self.eval_mode:
+            c_ex = self.examples[self.queue[index]]
+        else:
+            c_ex = self.examples[self.examples_list[index]]
+
+        audio_name, mix_waveform, onset_s, offset_s = read_audio(c_ex["mixture"], self.pad_to)
+
+        # labels
+        labels = c_ex["events"]
+        
+        # to steps
+        labels_df = pd.DataFrame(labels)
+        labels_df = process_labels(labels_df, onset_s)
+        
+        # check if labels exists:
+        if not len(labels_df):
+            max_len_targets = self.encoder.n_frames
+            strong = torch.zeros(max_len_targets, len(self.encoder.labels)).float()
+
+        else:
+            strong = self.encoder.encode_strong_df(labels_df)
+            strong = torch.from_numpy(strong).float()
+        print(index, labels_df)
+        data_dict = {
+                "audio_name": audio_name,
+                "waveform": mix_waveform, # (1, time)
+                "target": strong, # (time, classes)
+                "onoff": [max(onset_s, 0.)/self.pad_to*self.fs, min(offset_s, 10.)/self.pad_to*self.fs],
+            }
+
+        return data_dict
+
+    def generate_queue(self):
+        self.queue = []      
+        if self.config.debug:
+            self.total_size = 1000
+
+        if self.config.balanced_data:
+            if self.config.class_filter is not None:
+                class_set = self.config.class_filter[:]
+            else:
+                class_set = self.class_set
+
+            if self.config.enable_token_label:
+                while len(self.queue) < self.total_size * 2:
+                    random.shuffle(class_set)
+                    self.queue += [self.idx[d][random.randint(0, len(self.idx[d]) - 1)] for d in class_set]
+
+                self.queue = self.queue[:self.total_size * 2]
+                self.queue = [[self.queue[i],self.queue[i+1]] for i in range(0, self.total_size * 2, 2)]
+                assert len(self.queue) == self.total_size, "generate data error!!" 
+
+            else:
+                while len(self.queue) < self.total_size:
+                    random.shuffle(class_set)
+                    self.queue += [self.idx[d][random.randint(0, len(self.idx[d]) - 1)] for d in class_set]
+
+                self.queue = self.queue[:self.total_size]
+        else:
+            self.queue = [*range(self.total_size)]
+            random.shuffle(self.queue)
+        
+        logging.info("queue regenerated:%s" %(self.queue[:5]))
+    
 # For AudioSet
 class SEDDataset(Dataset):
     def __init__(self, index_path, idc, config, eval_mode = False):
