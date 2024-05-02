@@ -19,22 +19,23 @@ class ManyHotEncoder:
     """
 
     def __init__(
-        self, labels, audio_len, frame_len, frame_hop, net_pooling=1, fs=16000
+        # self, labels, audio_len, frame_len, frame_hop, net_pooling=1, fs=16000
+        self, labels, spec_size, mel_bins, htsat_depth, audio_len=10, patch_stride = (4,4), fs=32000
     ):
         if type(labels) in [np.ndarray, np.array]:
             labels = labels.tolist()
         self.labels = labels
+        self.spec_size = spec_size
+        self.mel_bins = mel_bins
+        self.freq_ratio = self.spec_size // self.mel_bins
+        self.target_T = int(self.spec_size * self.freq_ratio)
+        self.htsat_depth = htsat_depth
         self.audio_len = audio_len
-        self.frame_len = frame_len
-        self.frame_hop = frame_hop
+        self.patch_stride = patch_stride
         self.fs = fs
-        self.net_pooling = net_pooling
-        n_frames = self.audio_len * self.fs
-        # self.n_frames = int(
-        #     int(((n_frames - self.frame_len) / self.frame_hop)) / self.net_pooling
-        # )
-        # self.n_frames = int(int((n_frames / self.frame_hop)) / self.net_pooling)
-        self.n_frames = 1024
+        # self.n_frames = int(self.target_T / 2**(self.htsat_depth+1) * 8 * self.patch_stride[1])
+        self.n_frames = int(self.target_T / 2**(self.htsat_depth+1))
+
 
     def encode_weak(self, labels):
         """ Encode a list of weak labels into a numpy array
@@ -66,13 +67,18 @@ class ManyHotEncoder:
         return y
 
     def _time_to_frame(self, time):
-        samples = time * self.fs
-        frame = (samples) / self.frame_hop
-        return np.clip(frame / self.net_pooling, a_min=0, a_max=self.n_frames)
+        # n_bins = int(self.target_T / 2**(self.htsat_depth+1))
+        # frame = np.round(n_bins * time / self.audio_len, decimals = 0) * 8 * self.patch_stride[1]
+        frame = np.round(self.n_frames * time / self.audio_len, decimals = 0)
+        frame = int(frame)
+
+        return np.clip(frame, a_min=0, a_max=self.n_frames)
 
     def _frame_to_time(self, frame):
-        frame = frame * self.net_pooling / (self.fs / self.frame_hop)
-        return np.clip(frame, a_min=0, a_max=self.audio_len)
+        # time = frame / (8 * self.patch_stride[1]) * self.audio_len / (self.target_T / 2**(self.htsat_depth+1))
+        time = frame * self.audio_len / (self.target_T / 2**(self.htsat_depth+1))
+
+        return np.clip(time, a_min=0, a_max=self.audio_len)
 
     def encode_strong_df(self, label_df):
         """Encode a list (or pandas Dataframe or Serie) of strong labels, they correspond to a given filename
@@ -86,9 +92,9 @@ class ManyHotEncoder:
             Encoded labels, 1 where the label is present, 0 otherwise
         """
 
-        assert any(
-            [x is not None for x in [self.audio_len, self.frame_len, self.frame_hop]]
-        )
+        # assert any(
+        #     [x is not None for x in [self.audio_len, self.frame_len, self.frame_hop]]
+        # )
 
         samples_len = self.n_frames
         if type(label_df) is str:
