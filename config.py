@@ -4,15 +4,17 @@
 # The configuration for training the model
 
 exp_name = "exp_htsat_pretrain" # the saved ckpt prefix name of the model 
-workspace = "/home/kechen/Research/HTSAT" # the folder of your code
-dataset_path = "/home/Research/audioset" # the dataset path
+workspace = "/zelda/hongseok/HTS-Audio-Transformer" # the folder of your code
+dataset_path = "/zelda/hongseok/audioset" # the dataset path
 desed_folder = "/home/Research/DESED" # the desed file
+tsv_path = '/zelda/hongseok/audioset/metadata'
 
-dataset_type = "audioset" # "audioset" "esc-50" "scv2"
-index_type = "full_train" # only works for audioset
+dataset_type = "audioset_strong" # "audioset" "esc-50" "scv2"
+index_type = "strong_train" # only works for audioset
+# balanced_data = True # only works for audioset
 balanced_data = True # only works for audioset
 
-loss_type = "clip_bce" # 
+loss_type = "frame_bce" # 
 # AudioSet & SCV2: "clip_bce" |  ESC-50: "clip_ce" 
 
 # trained from a checkpoint, or evaluate a single model 
@@ -25,10 +27,12 @@ esc_fold = 0 # just for esc dataset, select the fold you need for evaluation and
 debug = False
 
 random_seed = 970131 # 19970318 970131 12412 127777 1009 34047
-batch_size = 32 * 4 # batch size per GPU x GPU number , default is 32 x 4 = 128
+batch_size = 64 # batch size per GPU x GPU number , default is 32 x 4 = 128
 learning_rate = 1e-3 # 1e-4 also workable 
 max_epoch = 100
-num_workers = 3
+num_workers = 16
+prefetch_factor = 4
+device = [0]
 
 lr_scheduler_epoch = [10,20,30]
 lr_rate = [0.02, 0.05, 0.1]
@@ -50,7 +54,7 @@ enable_repeat_mode = False # repeat the spectrogram / reshape the spectrogram
 enable_tscam = True # enbale the token-semantic layer
 
 # for signal processing
-sample_rate = 32000 # 16000 for scv2, 32000 for audioset and esc-50
+sample_rate = 16000 # 16000 for scv2, 32000 for audioset and esc-50
 clip_samples = sample_rate * 10 # audio_set 10-sec clip
 window_size = 1024
 hop_size = 320 # 160 for scv2, 320 for audioset and esc-50
@@ -60,7 +64,7 @@ fmax = 14000
 shift_max = int(clip_samples * 0.5)
 
 # for data collection
-classes_num = 527 # esc: 50 | audioset: 527 | scv2: 35
+classes_num = 407 # esc: 50 | audioset: 527 | scv2: 35 | audioset_strong: 447 |audioset_eval: 416
 patch_size = (25, 4) # deprecated
 crop_size = None # int(clip_samples * 0.5) deprecated
 
@@ -126,3 +130,20 @@ fl_audioset_mapping = [
     [74, 75, 76, 77, 78, 79],
     [377]
 ]
+
+# data augmentation
+enable_spec_augment = True
+n_time = 2
+n_freq = 2
+time_mask_param = 64
+freq_mask_param = 8
+
+enable_time_shift = True
+max_shift = 64
+
+# PSDS evaluation
+val_thresholds = [0.5] # thresholds used to compute f1 intersection in validation.
+n_test_thresholds = 50 # number of thresholds used to compute psds in test
+median_window = 7
+# synth_val_tsv = 
+# synth_val_dur = 
