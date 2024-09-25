@@ -27,8 +27,8 @@ class ManyHotEncoder:
         self.labels = labels
         self.spec_size = spec_size
         self.mel_bins = mel_bins
-        self.freq_ratio = self.spec_size // self.mel_bins
-        self.target_T = int(self.spec_size * self.freq_ratio)
+        self.freq_ratio = self.spec_size // self.mel_bins # 256 // 64 = 4
+        self.target_T = int(self.spec_size * self.freq_ratio) # 256 * 4 = 1024
         self.htsat_depth = htsat_depth
         self.audio_len = audio_len
         self.patch_stride = patch_stride

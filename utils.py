@@ -132,7 +132,6 @@ def clip_bce(pred, target):
     """Binary crossentropy loss.
     """
     return F.binary_cross_entropy(pred, target)
-    # return F.binary_cross_entropy(pred, target)
 
 
 def clip_ce(pred, target):
@@ -420,7 +419,7 @@ class SpecAugment(torch.nn.Module):
 
             return spectrogram
     
-    def time_masking(self, spectrograms, label = None, axis = 2, mask_value = 0.0):
+    def time_masking(self, spectrograms, label = None, axis = 3, mask_value = 0.0):
         # spectrograms (batch_size, channel, freq, time)
         # label (batch_size, time, class)
         mask_param = self._get_mask_param(self.time_mask_param, spectrograms.shape[axis])
@@ -435,7 +434,6 @@ class SpecAugment(torch.nn.Module):
         mask_start = min_value.long()[..., None, None]
         mask_end = (min_value + value).long()[..., None, None]
         mask = torch.arange(0, spectrograms.size(axis), device=device, dtype=dtype)
-        print(mask_start, mask_end)
 
         # Per batch example masking
         spectrograms = spectrograms.transpose(axis, -1)
@@ -443,8 +441,8 @@ class SpecAugment(torch.nn.Module):
         spectrograms = spectrograms.transpose(axis, -1)
         
         if label is not None:
-            mask_start = (mask_start.squeeze(1)/spectrograms.size(axis)*label.size(axis-1)).long()
-            mask_end = (mask_end.squeeze(1)/spectrograms.size(axis)*label.size(axis-1)).long()
+            mask_start = (mask_start.squeeze(1)/spectrograms.size(axis)*label.size(axis-2)).long()
+            mask_end = (mask_end.squeeze(1)/spectrograms.size(axis)*label.size(axis-2)).long()
             mask = torch.arange(0, label.size(axis-2), device=device, dtype=dtype)
 
             label = label.transpose(axis-2, -1)
@@ -871,3 +869,21 @@ def log_sedeval_metrics(predictions, ground_truth, save_dir=None):
         segment_res.results()["class_wise_average"]["f_measure"]["f_measure"],
         segment_res.results()["overall"]["f_measure"]["f_measure"],
     )  # return also segment measures
+
+
+def tensor_to_score_df(framewise_output, encoder):
+    """ Convert a tensor to a dataframe
+    Args:
+        framewise_output: torch.Tensor, the tensor to convert
+        encoder: ManyHotEncoder, the encoder to use to decode the tensor
+        threshold: float, the threshold to use to binarize the tensor
+    Returns:
+        pd.DataFrame, the dataframe of predictions
+    """
+    framewise_output = framewise_output.cpu().detach().numpy() # (T, K)
+    onset = encoder._frame_to_time(np.arange(0, framewise_output.shape[0]))
+    offset = encoder._frame_to_time(np.arange(1, framewise_output.shape[0] + 1))
+    data = np.concatenate([onset[:, None], offset[:, None], framewise_output], axis=1)
+    df = pd.DataFrame(data, columns=["onset", "offset"] + list(encoder.labels))
+
+    return df

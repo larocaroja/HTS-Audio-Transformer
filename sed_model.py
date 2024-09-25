@@ -13,8 +13,8 @@ from numpy.lib.function_base import average
 from sklearn import metrics
 import soundfile as sf
 from sklearn.metrics import average_precision_score, roc_auc_score, accuracy_score
+import pandas as pd
 
-from utils import get_loss_func, get_mix_lambda, d_prime
 import tensorboard
 import torch
 import torchaudio
@@ -26,23 +26,36 @@ from torch.nn.parameter import Parameter
 import torch.distributed as dist
 from torchlibrosa.stft import STFT, ISTFT, magphase
 import pytorch_lightning as pl
-from utils import do_mixup, get_mix_lambda, do_mixup_label
 import random
 
 from torchcontrib.optim import SWA
+from utils import get_loss_func, get_mix_lambda, d_prime, do_mixup, get_mix_lambda, do_mixup_label, batched_decode_preds, compute_per_intersection_macro_f1, compute_psds_from_operating_points, compute_psds_from_scores, log_sedeval_metrics, tensor_to_score_df
+import sed_scores_eval
 
 
 class SEDWrapper(pl.LightningModule):
-    def __init__(self, sed_model, config, dataset):
+    def __init__(self, sed_model, config, train_dataset, eval_dataset, strong = False):
         super().__init__()
         self.sed_model = sed_model
         self.config = config
-        self.dataset = dataset
+        self.train_dataset = train_dataset
+        self.eval_dataset = eval_dataset
         self.loss_func = get_loss_func(config.loss_type)
+        self.strong = strong
+
+        self.validation_step_outputs = []
+        # self.val_scores_postprocessed_buffer = {}
+        # self.val_buffer = {
+        #     k: pd.DataFrame() for k in self.config.val_thresholds
+        # }
 
     def evaluate_metric(self, pred, ans):
         ap = []
-        if self.config.dataset_type == "audioset":
+        if self.config.dataset_type == "audioset_strong":
+            bce = F.binary_cross_entropy(pred, ans)
+            
+            return {'bce': bce}
+        elif self.config.dataset_type == "audioset":
             mAP = np.mean(average_precision_score(ans, pred, average = None))
             mAUC = np.mean(roc_auc_score(ans, pred, average = None))
             dprime = d_prime(mAUC)
@@ -50,9 +63,11 @@ class SEDWrapper(pl.LightningModule):
         else:
             acc = accuracy_score(ans, np.argmax(pred, 1))
             return {"acc": acc}  
-    def forward(self, x, mix_lambda = None):
-        output_dict = self.sed_model(x, mix_lambda)
-        return output_dict["clipwise_output"], output_dict["framewise_output"]
+    
+    def forward(self, x, label = None):
+        output_dict, label = self.sed_model(x, label)
+
+        return output_dict["clipwise_output"], output_dict["framewise_output"], label
 
     def inference(self, x):
         self.device_type = next(self.parameters()).device
@@ -64,171 +79,252 @@ class SEDWrapper(pl.LightningModule):
         return output_dict
 
     def training_step(self, batch, batch_idx):
-        self.device_type = next(self.parameters()).device
-        if self.config.dataset_type == "audioset":
-            mix_lambda = torch.from_numpy(get_mix_lambda(0.5, len(batch["waveform"]))).to(self.device_type)
-        else:
-            mix_lambda = None
+        # if self.config.dataset_type == "audioset":
+        #     self.device_type = next(self.parameters()).device
+        #     mix_lambda = torch.from_numpy(get_mix_lambda(0.5, len(batch["waveform"]))).to(self.device_type)
+        # else:
+        #     mix_lambda = None
 
         # Another Choice: also mixup the target, but AudioSet is not a perfect data
         # so "adding noise" might be better than purly "mix"
         # batch["target"] = do_mixup_label(batch["target"])
         # batch["target"] = do_mixup(batch["target"], mix_lambda)
         
-        pred, _ = self(batch["waveform"], mix_lambda)
-        loss = self.loss_func(pred, batch["target"])
-        self.log("loss", loss, on_epoch= True, prog_bar=True)
+        # clipwise_output, framewise_output = self(batch["waveform"], mix_lambda)
+        clipwise_output, framewise_output, label = self(batch["waveform"], batch["target"])
+        
+        if not self.strong:
+            # Sound Event Classification
+            loss = self.loss_func(clipwise_output, batch["target"])
+            self.log("loss", loss, on_epoch= True, prog_bar=True)
+        else:
+            # Sound Event Detection
+            loss = self.loss_func(framewise_output, label)
+            self.log("loss", loss, on_epoch= True, prog_bar=True)
+        
         return loss
         
-    def training_epoch_end(self, outputs):
+    def on_train_epoch_end(self):
         # Change: SWA, deprecated
         # for opt in self.trainer.optimizers:
         #     if not type(opt) is SWA:
         #         continue
         #     opt.swap_swa_sgd()
-        self.dataset.generate_queue()
-
+        self.train_dataset.generate_queue()
 
     def validation_step(self, batch, batch_idx):
-        pred, _ = self(batch["waveform"])
-        return [pred.detach(), batch["target"].detach()]
-    
-    def validation_epoch_end(self, validation_step_outputs):
-        self.device_type = next(self.parameters()).device
-        pred = torch.cat([d[0] for d in validation_step_outputs], dim = 0)
-        target = torch.cat([d[1] for d in validation_step_outputs], dim = 0)
+        clipwise_output, framewise_output, _ = self(batch["waveform"])
+        
+        if self.config.dataset_type == "audioset_strong":
+            loss = self.loss_func(framewise_output, batch["target"])
+            self.log("val_loss", loss, on_epoch= True, prog_bar=True)
+            
+            # Build scores and ground truth
+            scores_dict = dict()
+            gt_dict = dict()
+            audio_duration = dict()
+            for i in range(len(batch["audio_name"])):
+                audio_name = os.path.splitext(os.path.basename(batch["audio_name"][i]))[0]
+                scores_dict[audio_name] = tensor_to_score_df(framewise_output[i], self.eval_dataset.encoder)
+                gt_dict[audio_name] = self.eval_dataset.ground_truth[audio_name]
+                audio_duration[audio_name] = 10.
+            
+            # DCASE PSDS Scenario 1
+            psds, (etpr, efpr), single_class_psd_rocs = sed_scores_eval.intersection_based.psds(
+                scores = scores_dict,
+                ground_truth = gt_dict,
+                audio_duration = audio_duration,
+                dtc_threshold = 0.7, gtc_threshold = 0.7,
+                cttc_threshold = None,
+                alpha_ct = 0., alpha_st = 1.,
+                unit_of_time='hour', max_efpr=100.,
+                )
+            
+            self.log("PSDS", psds, on_epoch= True, prog_bar=True)
 
-        if torch.cuda.device_count() > 1:
-            gather_pred = [torch.zeros_like(pred) for _ in range(dist.get_world_size())]
-            gather_target = [torch.zeros_like(target) for _ in range(dist.get_world_size())]
-            dist.barrier()
-
-        if self.config.dataset_type == "audioset":
-            metric_dict = {
-                "mAP": 0.,
-                "mAUC": 0.,
-                "dprime": 0.
-            }
         else:
-            metric_dict = {
-                "acc":0.
-            }
-        if torch.cuda.device_count() > 1:
-            dist.all_gather(gather_pred, pred)
-            dist.all_gather(gather_target, target)
-            if dist.get_rank() == 0:
-                gather_pred = torch.cat(gather_pred, dim = 0).cpu().numpy()
-                gather_target = torch.cat(gather_target, dim = 0).cpu().numpy()
+            pred = clipwise_output
+        # ground_truth = batch["target"]
+        # {batch["audio_name"] : [pred.detach().cpu()]}
+        
+        # self.validation_step_outputs.append([pred.detach().cpu(), batch["target"].detach().cpu()])
+        # self.log("mAP", metric_dict["mAP"], on_epoch = True, prog_bar=True, sync_dist=True)
+    
+    def on_validation_epoch_end(self):
+        self.device_type = next(self.parameters()).device
+
+        if self.config.dataset_type == "audioset_strong":
+            pass
+        else:
+            pred = torch.cat([d[0] for d in self.validation_step_outputs], dim = 0)
+            target = torch.cat([d[1] for d in self.validation_step_outputs], dim = 0)
+
+            if torch.cuda.device_count() > 1:
+                gather_pred = [torch.zeros_like(pred) for _ in range(dist.get_world_size())]
+                gather_target = [torch.zeros_like(target) for _ in range(dist.get_world_size())]
+                dist.barrier()
+            
+            if self.config.dataset_type == "audioset":
+                metric_dict = {
+                    "mAP": 0.,
+                    "mAUC": 0.,
+                    "dprime": 0.
+                }
+            else:
+                metric_dict = {
+                    "acc":0.
+                }
+            if torch.cuda.device_count() > 1:
+                dist.all_gather(gather_pred, pred)
+                dist.all_gather(gather_target, target)
+                if dist.get_rank() == 0:
+                    gather_pred = torch.cat(gather_pred, dim = 0).cpu().numpy()
+                    gather_target = torch.cat(gather_target, dim = 0).cpu().numpy()
+                    if self.config.dataset_type == "scv2":
+                        gather_target = np.argmax(gather_target, 1)
+                    metric_dict = self.evaluate_metric(gather_pred, gather_target)
+                    print(self.device_type, dist.get_world_size(), metric_dict, flush = True)
+            
+                if self.config.dataset_type == "audioset":
+                    self.log("mAP", metric_dict["mAP"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
+                    self.log("mAUC", metric_dict["mAUC"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
+                    self.log("dprime", metric_dict["dprime"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
+                else:
+                    self.log("acc", metric_dict["acc"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
+                dist.barrier()
+            else:
+                gather_pred = pred.cpu().numpy()
+                gather_target = target.cpu().numpy()
                 if self.config.dataset_type == "scv2":
                     gather_target = np.argmax(gather_target, 1)
                 metric_dict = self.evaluate_metric(gather_pred, gather_target)
-                print(self.device_type, dist.get_world_size(), metric_dict, flush = True)
-        
-            if self.config.dataset_type == "audioset":
-                self.log("mAP", metric_dict["mAP"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
-                self.log("mAUC", metric_dict["mAUC"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
-                self.log("dprime", metric_dict["dprime"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
-            else:
-                self.log("acc", metric_dict["acc"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
-            dist.barrier()
-        else:
-            gather_pred = pred.cpu().numpy()
-            gather_target = target.cpu().numpy()
-            if self.config.dataset_type == "scv2":
-                gather_target = np.argmax(gather_target, 1)
-            metric_dict = self.evaluate_metric(gather_pred, gather_target)
-            print(self.device_type, metric_dict, flush = True)
-        
-            if self.config.dataset_type == "audioset":
-                self.log("mAP", metric_dict["mAP"], on_epoch = True, prog_bar=True, sync_dist=False)
-                self.log("mAUC", metric_dict["mAUC"], on_epoch = True, prog_bar=True, sync_dist=False)
-                self.log("dprime", metric_dict["dprime"], on_epoch = True, prog_bar=True, sync_dist=False)
-            else:
-                self.log("acc", metric_dict["acc"], on_epoch = True, prog_bar=True, sync_dist=False)
+                print(self.device_type, metric_dict, flush = True)
             
-        
+                if self.config.dataset_type == "audioset":
+                    self.log("mAP", metric_dict["mAP"], on_epoch = True, prog_bar=True, sync_dist=False)
+                    self.log("mAUC", metric_dict["mAUC"], on_epoch = True, prog_bar=True, sync_dist=False)
+                    self.log("dprime", metric_dict["dprime"], on_epoch = True, prog_bar=True, sync_dist=False)
+                else:
+                    self.log("acc", metric_dict["acc"], on_epoch = True, prog_bar=True, sync_dist=False)
+
     def time_shifting(self, x, shift_len):
         shift_len = int(shift_len)
         new_sample = torch.cat([x[:, shift_len:], x[:, :shift_len]], axis = 1)
         return new_sample 
 
     def test_step(self, batch, batch_idx):
-        self.device_type = next(self.parameters()).device
-        preds = []
-        # time shifting optimization
-        if self.config.fl_local or self.config.dataset_type != "audioset": 
-            shift_num = 1 # framewise localization cannot allow the time shifting
-        else:
-            shift_num = 10 
-        for i in range(shift_num):
-            pred, pred_map = self(batch["waveform"])
-            preds.append(pred.unsqueeze(0))
-            batch["waveform"] = self.time_shifting(batch["waveform"], shift_len = 100 * (i + 1))
-        preds = torch.cat(preds, dim=0)
-        pred = preds.mean(dim = 0)
-        if self.config.fl_local:
-            return [
-                pred.detach().cpu().numpy(), 
-                pred_map.detach().cpu().numpy(),
-                batch["audio_name"],
-                batch["real_len"].cpu().numpy()
-            ]
-        else:
-            return [pred.detach(), batch["target"].detach()]
+        if self.config.dataset_type == "audioset_strong":
+            # audio_name, waveform, target, onoff
+            clipwise_output, framewise_output, _ = self(batch["waveform"])
+            loss = self.loss_func(framewise_output, batch["target"])
 
-    def test_epoch_end(self, test_step_outputs):
-        self.device_type = next(self.parameters()).device
-        if self.config.fl_local:
-            pred = np.concatenate([d[0] for d in test_step_outputs], axis = 0)
-            pred_map = np.concatenate([d[1] for d in test_step_outputs], axis = 0)
-            audio_name = np.concatenate([d[2] for d in test_step_outputs], axis = 0)
-            real_len = np.concatenate([d[3] for d in test_step_outputs], axis = 0)
-            heatmap_file = os.path.join(self.config.heatmap_dir, self.config.test_file + "_" + str(self.device_type) + ".npy")
-            save_npy = [
-                {
-                    "audio_name": audio_name[i],
-                    "heatmap": pred_map[i],
-                    "pred": pred[i],
-                    "real_len":real_len[i]
-                }
-                for i in range(len(pred))
-            ]
-            np.save(heatmap_file, save_npy)
+            # Build scores and ground truth
+            scores_dict = dict()
+            gt_dict = dict()
+            audio_duration = dict()
+            for i in range(len(batch["audio_name"])):
+                audio_name = os.path.splitext(os.path.basename(batch["audio_name"][i]))[0]
+                scores_dict[audio_name] = tensor_to_score_df(framewise_output[i], self.eval_dataset.encoder)
+                gt_dict[audio_name] = self.eval_dataset.ground_truth[audio_name]
+                audio_duration[audio_name] = 10.
+            
+            # DCASE PSDS Scenario 1
+            psds, (etpr, efpr), single_class_psd_rocs = sed_scores_eval.intersection_based.psds(
+                scores = scores_dict,
+                ground_truth = gt_dict,
+                audio_durations = audio_duration,
+                dtc_threshold = 0.7, gtc_threshold = 0.7,
+                cttc_threshold = None,
+                alpha_ct = 0., alpha_st = 1.,
+                unit_of_time='hour', max_efpr=100.,
+                )
+            print(scores_dict)
+            print()
+            print(gt_dict)
+
+            self.log("test_loss", loss, on_epoch= True, prog_bar=True)
+            self.log("PSDS", psds, on_epoch= True, prog_bar=True)
         else:
             self.device_type = next(self.parameters()).device
-            pred = torch.cat([d[0] for d in test_step_outputs], dim = 0)
-            target = torch.cat([d[1] for d in test_step_outputs], dim = 0)
-            gather_pred = [torch.zeros_like(pred) for _ in range(dist.get_world_size())]
-            gather_target = [torch.zeros_like(target) for _ in range(dist.get_world_size())]
-            dist.barrier()
-            if self.config.dataset_type == "audioset":
-                metric_dict = {
-                "mAP": 0.,
-                "mAUC": 0.,
-                "dprime": 0.
-                }
+            preds = []
+            # time shifting optimization
+            if self.config.fl_local or self.config.dataset_type != "audioset": 
+                shift_num = 1 # framewise localization cannot allow the time shifting
             else:
-                metric_dict = {
-                    "acc":0.
-                }
-            dist.all_gather(gather_pred, pred)
-            dist.all_gather(gather_target, target)
-            if dist.get_rank() == 0:
-                gather_pred = torch.cat(gather_pred, dim = 0).cpu().numpy()
-                gather_target = torch.cat(gather_target, dim = 0).cpu().numpy()
-                if self.config.dataset_type == "scv2":
-                    gather_target = np.argmax(gather_target, 1)
-                metric_dict = self.evaluate_metric(gather_pred, gather_target)
-                print(self.device_type, dist.get_world_size(), metric_dict, flush = True)
-            if self.config.dataset_type == "audioset":
-                self.log("mAP", metric_dict["mAP"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
-                self.log("mAUC", metric_dict["mAUC"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
-                self.log("dprime", metric_dict["dprime"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
+                shift_num = 10 
+            for i in range(shift_num):
+                pred, pred_map = self(batch["waveform"])
+                preds.append(pred.unsqueeze(0))
+                batch["waveform"] = self.time_shifting(batch["waveform"], shift_len = 100 * (i + 1))
+            preds = torch.cat(preds, dim=0)
+            pred = preds.mean(dim = 0)
+            if self.config.fl_local:
+                return [
+                    pred.detach().cpu().numpy(), 
+                    pred_map.detach().cpu().numpy(),
+                    batch["audio_name"],
+                    batch["real_len"].cpu().numpy()
+                ]
             else:
-                self.log("acc", metric_dict["acc"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
-            dist.barrier()
-    
+                return [pred.detach(), batch["target"].detach()]
 
+    def on_test_epoch_end(self):
+        # self.device_type = next(self.parameters()).device
+        pass
+        # if self.config.dataset_type == "audioset_strong":
+        #     pass
+        
+        # else:
+        #     if self.config.fl_local:
+        #         pred = np.concatenate([d[0] for d in test_step_outputs], axis = 0)
+        #         pred_map = np.concatenate([d[1] for d in test_step_outputs], axis = 0)
+        #         audio_name = np.concatenate([d[2] for d in test_step_outputs], axis = 0)
+        #         real_len = np.concatenate([d[3] for d in test_step_outputs], axis = 0)
+        #         heatmap_file = os.path.join(self.config.heatmap_dir, self.config.test_file + "_" + str(self.device_type) + ".npy")
+        #         save_npy = [
+        #             {
+        #                 "audio_name": audio_name[i],
+        #                 "heatmap": pred_map[i],
+        #                 "pred": pred[i],
+        #                 "real_len":real_len[i]
+        #             }
+        #             for i in range(len(pred))
+        #         ]
+        #         np.save(heatmap_file, save_npy)
+        #     else:
+        #         self.device_type = next(self.parameters()).device
+        #         pred = torch.cat([d[0] for d in test_step_outputs], dim = 0)
+        #         target = torch.cat([d[1] for d in test_step_outputs], dim = 0)
+        #         gather_pred = [torch.zeros_like(pred) for _ in range(dist.get_world_size())]
+        #         gather_target = [torch.zeros_like(target) for _ in range(dist.get_world_size())]
+        #         dist.barrier()
+        #         if self.config.dataset_type == "audioset":
+        #             metric_dict = {
+        #             "mAP": 0.,
+        #             "mAUC": 0.,
+        #             "dprime": 0.
+        #             }
+        #         else:
+        #             metric_dict = {
+        #                 "acc":0.
+        #             }
+        #         dist.all_gather(gather_pred, pred)
+        #         dist.all_gather(gather_target, target)
+        #         if dist.get_rank() == 0:
+        #             gather_pred = torch.cat(gather_pred, dim = 0).cpu().numpy()
+        #             gather_target = torch.cat(gather_target, dim = 0).cpu().numpy()
+        #             if self.config.dataset_type == "scv2":
+        #                 gather_target = np.argmax(gather_target, 1)
+        #             metric_dict = self.evaluate_metric(gather_pred, gather_target)
+        #             print(self.device_type, dist.get_world_size(), metric_dict, flush = True)
+        #         if self.config.dataset_type == "audioset":
+        #             self.log("mAP", metric_dict["mAP"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
+        #             self.log("mAUC", metric_dict["mAUC"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
+        #             self.log("dprime", metric_dict["dprime"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
+        #         else:
+        #             self.log("acc", metric_dict["acc"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
+        #         dist.barrier()
+    
     def configure_optimizers(self):
         optimizer = optim.AdamW(
             filter(lambda p: p.requires_grad, self.parameters()),
@@ -256,6 +352,12 @@ class SEDWrapper(pl.LightningModule):
         
         return [optimizer], [scheduler]
 
+    def tensor_to_dict(self, framewise_output):
+        result = {}
+        for i in range(framewise_output.shape[0]):
+            if framewise_output[i] > 0.5:
+                result[self.train_dataset.labels[i]] = framewise_output[i]
+        return result
 
 
 class Ensemble_SEDWrapper(pl.LightningModule):
@@ -384,6 +486,3 @@ class Ensemble_SEDWrapper(pl.LightningModule):
             else:
                 self.log("acc", metric_dict["acc"] * float(dist.get_world_size()), on_epoch = True, prog_bar=True, sync_dist=True)
             dist.barrier()
-
-
-    

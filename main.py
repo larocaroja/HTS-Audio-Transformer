@@ -15,22 +15,25 @@ import logging
 import pickle
 import random
 from datetime import datetime
+import pandas as pd
 
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, sampler
 from torch.utils.data.distributed import DistributedSampler
-
+torch.set_float32_matmul_precision('medium')
 from utils import create_folder, dump_config, process_idc, prepprocess_audio, init_hier_head
 
 import config
 from sed_model import SEDWrapper, Ensemble_SEDWrapper
 from models import Cnn14_DecisionLevelMax
-from data_generator import SEDDataset, DESED_Dataset, ESC_Dataset, SCV2_Dataset
+from data_generator import StronglyAnnotatedSet, SEDDataset, DESED_Dataset, ESC_Dataset, SCV2_Dataset
+from encoder import ManyHotEncoder
 
 
 from model.htsat import HTSAT_Swin_Transformer
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
 import warnings
 
@@ -50,9 +53,11 @@ class data_prep(pl.LightningDataModule):
         train_loader = DataLoader(
             dataset = self.train_dataset,
             num_workers = config.num_workers,
+            prefetch_factor = config.prefetch_factor,
             batch_size = config.batch_size // self.device_num,
             shuffle = False,
-            sampler = train_sampler
+            sampler = train_sampler,
+            pin_memory=True,
         )
         return train_loader
     def val_dataloader(self):
@@ -60,9 +65,11 @@ class data_prep(pl.LightningDataModule):
         eval_loader = DataLoader(
             dataset = self.eval_dataset,
             num_workers = config.num_workers,
+            prefetch_factor = config.prefetch_factor,
             batch_size = config.batch_size // self.device_num,
             shuffle = False,
-            sampler = eval_sampler
+            sampler = eval_sampler,
+            pin_memory=True,
         )
         return eval_loader
     def test_dataloader(self):
@@ -169,10 +176,11 @@ def esm_test():
     )
     trainer.test(model, datamodule=audioset_data)
 
-
 def test():
-    device_num = torch.cuda.device_count()
+    device_num = len(config.device) if isinstance(config.device, list) else 1
+    strong = False
     print("each batch size:", config.batch_size // device_num)
+
     # dataset file pathes
     if config.fl_local:
         fl_npy = np.load(config.fl_dataset, allow_pickle = True)
@@ -182,7 +190,37 @@ def test():
             config = config
         )
     else:
-        if config.dataset_type == "audioset":
+        if config.dataset_type == 'audioset_strong':
+            eval_data_path = os.path.join(config.dataset_path, "audios/eval_segments_16k")
+            strong = True
+
+            eval_tsv = os.path.join(config.tsv_path, "audioset_eval_strong.tsv")
+            eval_tsv = pd.read_csv(eval_tsv, sep = '\t')
+
+            label_classes = list()
+
+            for _, row in eval_tsv.iterrows(): # train_tsv and eval_tsv have been processed to have the same label classes
+                label_classes.append(row['label'])
+
+            label_classes = list(set(label_classes))
+            encoder  = ManyHotEncoder(
+                labels = label_classes,
+                spec_size = config.htsat_spec_size,
+                mel_bins = config.mel_bins,
+                htsat_depth = len(config.htsat_depth),
+                audio_len=10,
+                patch_stride = config.htsat_stride,
+                fs=config.sample_rate
+                )
+            
+            eval_dataset = StronglyAnnotatedSet(
+                audio_folder = eval_data_path,
+                tsv_entries = eval_tsv,
+                encoder = encoder,
+                config = config,
+                eval_mode = True
+            )
+        elif config.dataset_type == "audioset":
             eval_index_path = os.path.join(config.dataset_path,"hdf5s", "indexes", "eval.h5")
             eval_idc = np.load("eval_idc.npy", allow_pickle = True)
             eval_dataset = SEDDataset(
@@ -209,18 +247,27 @@ def test():
         
     audioset_data = data_prep(eval_dataset, eval_dataset, device_num)
     trainer = pl.Trainer(
-        deterministic=True,
-        gpus = device_num, 
+        accelerator = 'cuda',
+        devices = config.device,
         max_epochs = config.max_epoch,
-        auto_lr_find = True,    
-        sync_batchnorm = True,
-        checkpoint_callback = False,
-        accelerator = "ddp" if device_num > 1 else None,
         num_sanity_val_steps = 0,
-        # resume_from_checkpoint = config.resume_checkpoint,
-        replace_sampler_ddp = False,
-        gradient_clip_val=1.0
+        gradient_clip_val=1.0,
+        deterministic='warn',
+        sync_batchnorm = True,
     )
+    # trainer = pl.Trainer(
+        # deterministic=True,
+        # gpus = device_num, 
+        # max_epochs = config.max_epoch,
+        # auto_lr_find = True,    
+        # sync_batchnorm = True,
+        # checkpoint_callback = False,
+        # accelerator = "ddp" if device_num > 1 else None,
+        # num_sanity_val_steps = 0,
+        # resume_from_checkpoint = config.resume_checkpoint,
+        # replace_sampler_ddp = False,
+        # gradient_clip_val=1.0
+    # )
     sed_model = HTSAT_Swin_Transformer(
         spec_size=config.htsat_spec_size,
         patch_size=config.htsat_patch_size,
@@ -237,23 +284,29 @@ def test():
     model = SEDWrapper(
         sed_model = sed_model, 
         config = config,
-        dataset = eval_dataset
+        train_dataset = None,
+        eval_dataset = eval_dataset,
+        strong = strong
     )
-    if config.resume_checkpoint is not None:
-        ckpt = torch.load(config.resume_checkpoint, map_location="cpu")
+    
+    if config.test_checkpoint is not None:
+        ckpt = torch.load(config.test_checkpoint, map_location="cpu")
         ckpt["state_dict"].pop("sed_model.head.weight")
         ckpt["state_dict"].pop("sed_model.head.bias")
         model.load_state_dict(ckpt["state_dict"], strict=False)
     trainer.test(model, datamodule=audioset_data)
 
-    
-
 def train():
-    device_num = torch.cuda.device_count()
+    device_num = len(config.device) if isinstance(config.device, list) else 1
+    strong = False
     print("each batch size:", config.batch_size // device_num)
-    
+
     # dataset file pathes
-    if config.dataset_type == "audioset":
+    if config.dataset_type == 'audioset_strong':
+        train_data_path = os.path.join(config.dataset_path, "audios/unbalanced_train_segments_16k")
+        eval_data_path = os.path.join(config.dataset_path, "audios/eval_segments_16k")
+        strong = True
+    elif config.dataset_type == "audioset":
         train_index_path = os.path.join(config.dataset_path, "hdf5s","indexes", config.index_type + ".h5")
         eval_index_path = os.path.join(config.dataset_path,"hdf5s", "indexes", "eval.h5")
         train_idc = np.load(config.index_type + "_idc.npy", allow_pickle = True)
@@ -274,7 +327,44 @@ def train():
         dump_config(config, os.path.join(exp_dir, config.exp_name), False)
 
     # import dataset SEDDataset
-    if config.dataset_type == "audioset":
+    if config.dataset_type == "audioset_strong":
+        print("Using strongly-labeled Audioset")
+        train_tsv = os.path.join(config.tsv_path, "audioset_train_strong.tsv")
+        eval_tsv = os.path.join(config.tsv_path, "audioset_eval_strong.tsv")
+        train_tsv = pd.read_csv(train_tsv, sep = '\t')
+        eval_tsv = pd.read_csv(eval_tsv, sep = '\t')
+        # labels = pd.read_csv(config.tsv_path, sep = '\t')
+        label_classes = list()
+
+        for _, row in eval_tsv.iterrows(): # train_tsv and eval_tsv have been processed to have the same label classes
+            label_classes.append(row['label'])
+
+        label_classes = list(set(label_classes))
+        encoder  = ManyHotEncoder(
+            labels = label_classes,
+            spec_size = config.htsat_spec_size,
+            mel_bins = config.mel_bins,
+            htsat_depth = len(config.htsat_depth),
+            audio_len=10,
+            patch_stride = config.htsat_stride,
+            fs=config.sample_rate
+            )
+
+        dataset = StronglyAnnotatedSet(
+            audio_folder = train_data_path,
+            tsv_entries = train_tsv,
+            encoder = encoder,
+            config = config,
+            eval_mode = False
+        )
+        eval_dataset = StronglyAnnotatedSet(
+            audio_folder = eval_data_path,
+            tsv_entries = eval_tsv,
+            encoder = encoder,
+            config = config,
+            eval_mode = True
+        )
+    elif config.dataset_type == "audioset":
         print("Using Audioset")
         dataset = SEDDataset(
             index_path=train_index_path,
@@ -311,9 +401,19 @@ def train():
             config = config,
             eval_mode = True
         )
+    print("Dataset loaded!") 
+    print("Train dataset size: ", len(dataset))
+    print("Eval dataset size: ", len(eval_dataset))
 
     audioset_data = data_prep(dataset, eval_dataset, device_num)
-    if config.dataset_type == "audioset":
+    if config.dataset_type == "audioset_strong":
+        checkpoint_callback = ModelCheckpoint(
+            monitor = "val_loss",
+            filename='l-{epoch:d}-{val_loss:.3f}',
+            save_top_k = 20,
+            mode = "min"
+        )
+    elif config.dataset_type == "audioset":
         checkpoint_callback = ModelCheckpoint(
             monitor = "mAP",
             filename='l-{epoch:d}-{mAP:.3f}-{mAUC:.3f}',
@@ -327,20 +427,21 @@ def train():
             save_top_k = 20,
             mode = "max"
         )
+
+    wandb_logger = WandbLogger(name = config.exp_name, project = "HTSAT_SED", entity = "hongseok")
     trainer = pl.Trainer(
-        deterministic=True,
-        default_root_dir = checkpoint_dir,
-        gpus = device_num, 
-        val_check_interval = 0.1,
-        max_epochs = config.max_epoch,
-        auto_lr_find = True,    
-        sync_batchnorm = True,
+        accelerator = 'cuda',
+        devices = config.device,
         callbacks = [checkpoint_callback],
-        accelerator = "ddp" if device_num > 1 else None,
+        max_epochs = config.max_epoch,
+        val_check_interval = 1.0,
+        # check_val_every_n_epoch = 5,
         num_sanity_val_steps = 0,
-        resume_from_checkpoint = None, 
-        replace_sampler_ddp = False,
-        gradient_clip_val=1.0
+        gradient_clip_val=1.0,
+        deterministic='warn',
+        sync_batchnorm = True,
+        default_root_dir = checkpoint_dir,
+        logger = wandb_logger
     )
     sed_model = HTSAT_Swin_Transformer(
         spec_size=config.htsat_spec_size,
@@ -358,8 +459,11 @@ def train():
     model = SEDWrapper(
         sed_model = sed_model, 
         config = config,
-        dataset = dataset
+        train_dataset = dataset,
+        eval_dataset = eval_dataset,
+        strong = strong
     )
+
     if config.resume_checkpoint is not None:
         ckpt = torch.load(config.resume_checkpoint, map_location="cpu")
         ckpt["state_dict"].pop("sed_model.head.weight")
@@ -409,8 +513,9 @@ def main():
     args = parser.parse_args()
     # default settings
     logging.basicConfig(level=logging.INFO) 
-    pl.utilities.seed.seed_everything(seed = config.random_seed)
+    pl.seed_everything(seed = config.random_seed)
 
+    print(args.mode)
     if args.mode == "train":
         train()
     elif args.mode == "test":

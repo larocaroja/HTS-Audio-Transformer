@@ -21,7 +21,7 @@ from torchlibrosa.augmentation import SpecAugmentation
 from itertools import repeat
 from typing import List
 from .layers import PatchEmbed, Mlp, DropPath, trunc_normal_, to_2tuple
-from utils import do_mixup, interpolate
+from utils import do_mixup, interpolate, MixUp, SpecAugment, TimeShift
 
 
 # below codes are based and referred from https://github.com/microsoft/Swin-Transformer
@@ -220,8 +220,8 @@ class SwinTransformerBlock(nn.Module):
     def forward(self, x):
         # pdb.set_trace()
         H, W = self.input_resolution
-        # print("H: ", H)
-        # print("W: ", W)
+        # # print("H: ", H)
+        # # print("W: ", W)
         # pdb.set_trace()
         B, L, C = x.shape
         # assert L == H * W, "input feature has wrong size"
@@ -457,11 +457,16 @@ class HTSAT_Swin_Transformer(nn.Module):
         self.logmel_extractor = LogmelFilterBank(sr=config.sample_rate, n_fft=config.window_size, 
             n_mels=config.mel_bins, fmin=config.fmin, fmax=config.fmax, ref=ref, amin=amin, top_db=top_db, 
             freeze_parameters=True)
-        # Spec augmenter
-        self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
-            freq_drop_width=8, freq_stripes_num=2) # 2 2
+        # Data Augmentation
+        # self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
+        #     freq_drop_width=8, freq_stripes_num=2) # 2 2
+        self.spec_augment = SpecAugment(
+            n_time = self.config.n_time, n_freq = self.config.n_freq, 
+            time_mask_param = self.config.time_mask_param, 
+            freq_mask_param = self.config.freq_mask_param
+            )
+        self.time_shift = TimeShift(max_shift = self.config.max_shift)
         self.bn0 = nn.BatchNorm2d(self.config.mel_bins)
-
 
         # split spctrogram into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -582,11 +587,14 @@ class HTSAT_Swin_Transformer(nn.Module):
 
         frames_num = x.shape[2]        
         x = self.patch_embed(x)
+        # print('forward_feartures')
+        # print(x.shape)
         if self.ape:
             x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
         for i, layer in enumerate(self.layers):
             x, attn = layer(x)
+            # print(x.shape)
             # A deprecated optimization for using a hierarchical output from different blocks
             # if self.config.htsat_hier_output:
             #     hier_x.append(x)
@@ -628,16 +636,19 @@ class HTSAT_Swin_Transformer(nn.Module):
 
         if self.config.enable_tscam:
             # for x
+            # print(x.shape)
             x = self.norm(x)
             B, N, C = x.shape
             SF = frames_num // (2 ** (len(self.depths) - 1)) // self.patch_stride[0]
             ST = frames_num // (2 ** (len(self.depths) - 1)) // self.patch_stride[1]
             x = x.permute(0,2,1).contiguous().reshape(B, C, SF, ST)
+            # print(x.shape)
             B, C, F, T = x.shape
             # group 2D CNN
             c_freq_bin = F // self.freq_ratio
             x = x.reshape(B, C, F // c_freq_bin, c_freq_bin, T)
             x = x.permute(0,1,3,2,4).contiguous().reshape(B, C, c_freq_bin, -1)
+            # print(x.shape)
 
             # get latent_output
             latent_output = self.avgpool(torch.flatten(x,2))
@@ -657,9 +668,12 @@ class HTSAT_Swin_Transformer(nn.Module):
                 attn_min = torch.min(attn, dim = 1, keepdim = True)[0]
                 attn = ((attn * 0.15) + (attn_max * 0.85 - attn_min)) / (attn_max - attn_min)
                 attn = attn.unsqueeze(dim = 2)
-
+            
+            # print(self.tscam_conv)
             x = self.tscam_conv(x)
+            # print(x.shape)
             x = torch.flatten(x, 2) # B, C, T
+            # print(x.shape)
             
             # A deprecated optimization for using the max value instead of average value
             # if self.config.htsat_use_max:
@@ -670,7 +684,10 @@ class HTSAT_Swin_Transformer(nn.Module):
             if self.config.htsat_attn_heatmap:
                 fpx = interpolate(torch.sigmoid(x).permute(0,2,1).contiguous() * attn, 8 * self.patch_stride[1]) 
             else: 
-                fpx = interpolate(torch.sigmoid(x).permute(0,2,1).contiguous(), 8 * self.patch_stride[1]) 
+                # fpx = interpolate(torch.sigmoid(x).permute(0,2,1).contiguous(), 8 * self.patch_stride[1]) 
+                fpx = torch.sigmoid(x).permute(0,2,1).contiguous()
+                # print(fpx.shape)
+                # print(8 * self.patch_stride[1])
             
             # A deprecated optimization for using the max value instead of average value
             # if self.config.htsat_use_max:
@@ -730,10 +747,13 @@ class HTSAT_Swin_Transformer(nn.Module):
         B, C, T, F = x.shape
         target_T = int(self.spec_size * self.freq_ratio)
         target_F = self.spec_size // self.freq_ratio
+        # print(f"target_T: {target_T}, target_F: {target_F}")
+        # print(f"T: {T}, F: {F}")
         assert T <= target_T and F <= target_F, "the wav size should less than or equal to the swin input size"
         # to avoid bicubic zero error
         if T < target_T:
             x = nn.functional.interpolate(x, (target_T, x.shape[3]), mode="bicubic", align_corners=True)
+            # print(x.shape)
         if F < target_F:
             x = nn.functional.interpolate(x, (x.shape[2], target_F), mode="bicubic", align_corners=True)
         x = x.permute(0,1,3,2).contiguous()
@@ -741,6 +761,7 @@ class HTSAT_Swin_Transformer(nn.Module):
         # print(x.shape)
         x = x.permute(0,1,3,2,4).contiguous()
         x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3], x.shape[4])
+        # print(x.shape)
         return x
     
     # Repeat the wavform to a img size, if you want to use the pretrained swin transformer model
@@ -759,19 +780,26 @@ class HTSAT_Swin_Transformer(nn.Module):
         x = x.repeat(repeats = (1,1,4,1))
         return x
 
-    def forward(self, x: torch.Tensor, mixup_lambda = None, infer_mode = False):# out_feat_keys: List[str] = None):
+    def forward(self, x: torch.Tensor, label: torch.Tensor = None, infer_mode = False):# out_feat_keys: List[str] = None):
         x = self.spectrogram_extractor(x)   # (batch_size, 1, time_steps, freq_bins)
         x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
-        
+        # print(x.shape)
         
         x = x.transpose(1, 3)
         x = self.bn0(x)
         x = x.transpose(1, 3)
+
         if self.training:
-            x = self.spec_augmenter(x)
-        if self.training and mixup_lambda is not None:
-            x = do_mixup(x, mixup_lambda)
-        
+            x = x.transpose(-1, -2)
+            
+            if self.config.enable_spec_augment:
+                x, label = self.spec_augment(x, label)
+
+            if self.config.enable_time_shift:
+                x, label = self.time_shift(x, label)
+
+            x = x.transpose(-1, -2) 
+
         if infer_mode:
             # in infer mode. we need to handle different length audio input
             frame_num = x.shape[2]
@@ -833,4 +861,4 @@ class HTSAT_Swin_Transformer(nn.Module):
                 x = self.reshape_wav2img(x)
                 output_dict = self.forward_features(x)
         # x = self.head(x)
-        return output_dict
+        return output_dict, label

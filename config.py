@@ -3,7 +3,7 @@
 # HTS-AT: A HIERARCHICAL TOKEN-SEMANTIC AUDIO TRANSFORMER FOR SOUND CLASSIFICATION AND DETECTION
 # The configuration for training the model
 
-exp_name = "exp_htsat_pretrain" # the saved ckpt prefix name of the model 
+exp_name = "exp_htsat_sed" # the saved ckpt prefix name of the model 
 workspace = "/zelda/hongseok/HTS-Audio-Transformer" # the folder of your code
 dataset_path = "/zelda/hongseok/audioset" # the dataset path
 desed_folder = "/home/Research/DESED" # the desed file
@@ -11,16 +11,15 @@ tsv_path = '/zelda/hongseok/audioset/metadata'
 
 dataset_type = "audioset_strong" # "audioset" "esc-50" "scv2"
 index_type = "strong_train" # only works for audioset
-# balanced_data = True # only works for audioset
 balanced_data = True # only works for audioset
+# balanced_data = False # only works for audioset
 
 loss_type = "frame_bce" # 
 # AudioSet & SCV2: "clip_bce" |  ESC-50: "clip_ce" 
 
 # trained from a checkpoint, or evaluate a single model 
-resume_checkpoint = None 
-# "/home/Research/model_backup/AudioSet/HTSAT_AudioSet_Saved_1.ckpt"
- 
+resume_checkpoint =  "/zelda/hongseok/HTS-Audio-Transformer/weights/AudioSet/HTSAT_AudioSet_Saved_1.ckpt"
+test_checkpoint =  "/zelda/hongseok/HTS-Audio-Transformer/results/exp_htsat_sed/checkpoint/lightning_logs/version_1/checkpoints/l-epoch=9-val_loss=0.015.ckpt"
 esc_fold = 0 # just for esc dataset, select the fold you need for evaluation and (+1) validation
 
 
@@ -29,7 +28,7 @@ debug = False
 random_seed = 970131 # 19970318 970131 12412 127777 1009 34047
 batch_size = 64 # batch size per GPU x GPU number , default is 32 x 4 = 128
 learning_rate = 1e-3 # 1e-4 also workable 
-max_epoch = 100
+max_epoch = 50
 num_workers = 16
 prefetch_factor = 4
 device = [0]

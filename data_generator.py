@@ -20,6 +20,7 @@ from utils import int16_to_float32
 from glob import glob
 import pandas as pd
 import torchaudio
+from tqdm import tqdm
 
 from utils import read_audio, process_labels
 
@@ -45,7 +46,7 @@ class StronglyAnnotatedSet(Dataset):
         self.ground_truth = {}
         self.idx = defaultdict(list)
 
-        for _, r in tsv_entries.iterrows():
+        for _, r in tqdm(tsv_entries.iterrows()):
             if r["end_time_seconds"] - r["start_time_seconds"] < resolution:
                 continue
 
@@ -87,7 +88,7 @@ class StronglyAnnotatedSet(Dataset):
         return self.total_size
 
     def __getitem__(self, index):
-        if not self.eval_mode:
+        if (not self.eval_mode) and self.config.balanced_data:
             c_ex = self.examples[self.queue[index]]
         else:
             c_ex = self.examples[self.examples_list[index]]
@@ -109,7 +110,7 @@ class StronglyAnnotatedSet(Dataset):
         else:
             strong = self.encoder.encode_strong_df(labels_df)
             strong = torch.from_numpy(strong).float()
-        print(index, labels_df)
+
         data_dict = {
                 "audio_name": audio_name,
                 "waveform": mix_waveform, # (1, time)
